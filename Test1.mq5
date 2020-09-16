@@ -6,6 +6,9 @@
 #property copyright "Copyright 2020, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
 #property version   "1.00"
+#include <Trade\Trade.mqh>
+CTrade trade;
+// check it min 50
 
 //+------------------------------------------------------------------+
 //| Input parameters                                                 |
@@ -29,7 +32,7 @@ input int            closeMinutes=45;                // Close time (BMF)
 input group          "Fast Moving Average"
 input int            iMA_fast_ma_period=8;         // med avg fast 
 input int            iMA_fast_ma_shift=0;
-input ENUM_MA_METHOD iMA_fast_ma_method=MODE_SMA;         // Soft fast == 0
+input ENUM_MA_METHOD iMA_fast_ma_method=MODE_SMA;  // Soft fast == 0
 
 input group          "Slow Moving Average"
 input int            iMA_slow_ma_period=21;        // med avg fast 
@@ -46,7 +49,17 @@ input int            signal_period=9;              // Soft fast
 //| MONITORING GLOBAL VARIABLES                                      |
 //+------------------------------------------------------------------+
 
-string glTipoOrdem="UNDEFINED"; // UNDEFINED, BUY OR SELL
+string               gl_TipoOrdem="UNDEFINED";      // UNDEFINED, BUY OR SELL
+string               gl_TipoOrdemMM = "UNDEFINED";
+string               gl_TipoOrdemMACD = "UNDEFINED";
+bool                 gl_openPosition = false;      // Default starting value
+long                 gl_positionType = 0;          // Initialized
+double               gl_contracts = 0;             //
+string               gl_tendenciaMACD = "NA";      // Trend
+string               gl_tendenciaMM = "NA";        // Trend
+int                  gl_Order = 0;
+long                 gl_ticks = 0;
+
 
 //+------------------------------------------------------------------+
 //| HANDLES (HEART) -- ALL INDICATORS MUST HAVE A HANDLE             |
@@ -71,6 +84,13 @@ double               iMA_slow_buffer[];            // iMA_fast_buffer[0] iMA_fas
 double               iMACD_main_buffer[];          // iMACD_main_buffer[0]
 double               iMACD_signal_buffer[]; 
 
+
+// Class 3 - Strategy
+// Pode ser feito negocio a negocio (compra 100 petro, vende 100 petro) or timer (por tick ou timer)
+// Ou Movimentacao de book (profundidade de book)
+// Curso basico: comecar pelo tick, que serve para 90% dos casos
+
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
@@ -91,15 +111,19 @@ int OnInit()
    }
    if(stopLoss == 0)
    {
+      Print("stopLoss cannot smaller or equal 0");
+      return(INIT_FAILED);
    }
    
 
    if(stopGain == 0)
    {
+      Print("stopGain cannot smaller or equal 0");
+      return(INIT_FAILED);
    }
    
 
-   EventSetTimer(5); // Aqui aciono o timer de 5 em 5 segundos
+   EventSetTimer(240); // Aqui aciono o timer de 240 segundos
    Print("Arrastei o robo para o grafico");
    
    //+------------------------------------------------------------------+
@@ -134,6 +158,8 @@ int OnInit()
    ChartIndicatorAdd(ChartID(),1,iMACD_handle); // 1 means that it will be plotted in the second chart. "Window 1"
    
    Print("Inicializacao realizada com sucesso.");
+   
+   gl_ticks=0;
    
    return(INIT_SUCCEEDED);
    
@@ -188,9 +214,165 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
-void OnTick()
+void OnTick() 
   {
-//---
+// each tick == each business. After a business, update the following variables  
+   gl_ticks = gl_ticks + 1;
+  
+//+------------------------------------------------------------------+
+//| Chart initialization                                             |
+//+------------------------------------------------------------------+
+
+   ResetLastError(); // Clean all pending errors   
+   // FIRST THING TO DO AFTER A BUSINESS: Update the values
+   CopyBuffer(iMA_fast_handle,0,0,3,iMA_fast_buffer); // Will copy 3 positions from iMA_fast_buffer [0].[1],[2] to iMA_fast_handle
+   CopyBuffer(iMA_slow_handle,0,0,3,iMA_slow_buffer); // Position 0, candle position 0, 3 items
+
+   CopyBuffer(iMACD_handle,0,0,3,iMACD_main_buffer); // Same, but this is the histogram, the next is the signal
+   CopyBuffer(iMACD_handle,1,0,3,iMACD_main_buffer); // Note that this copies to the position 1
+   
+   MqlDateTime dt;  // It is an struct. dt.hour, dt.min, ...
+   TimeCurrent(dt); // Server time. > if you want use TimeLocal() To know the local time. TimeCurrent = time of the deal
+   
+   
+   // Update date time vars
+   double loc_currTime=dt.hour*60+dt.min;
+   double loc_openTime=openHour*60+openMinutes;
+   double loc_closeTime=closeHour*60+closeMinutes-1; // Do not use last minute. // first 15 minutes have lots of problem
+   
+   // Check open market
+   if(loc_currTime<loc_openTime)
+   {
+      Comment("Robot waiting the opening.");
+      // Assure all variables are "initialized" as if it was the begining of the day
+      //  as if it was brand new
+      return;
+   }
+
+   // Check closed market
+   if(loc_currTime>loc_closeTime)
+   {
+      Comment("Robot - Market closed.");
+      // Do something so that the robot does not sleep with an open position
+      
+      return;
+   }
+   //Print(TimeCurrent());
+   //Print(TimeLocal());
+   
+   // Check position (tenho custodia)
+
+   gl_openPosition=PositionSelect(_Symbol);
+   
+   if(gl_openPosition)
+   {
+      gl_positionType=PositionGetInteger(POSITION_TYPE); //buyer or seller
+      gl_contracts=PositionGetDouble(POSITION_VOLUME);   // Quantity
+   }
+   else
+   {
+      gl_positionType=WRONG_VALUE; // -1
+   }
+   
+   // ANALYSIS
+   // ========
+      
+   // correct way   
+   if(iMA_fast_buffer[0]>iMA_slow_buffer[0] && 
+      iMA_slow_buffer[1] > iMA_fast_buffer[1])
+         gl_TipoOrdemMM="COMPRA";
+
+   if(iMA_fast_buffer[0]<iMA_slow_buffer[0] && 
+      iMA_fast_buffer[1] > iMA_slow_buffer[1])
+         gl_TipoOrdemMM="VENDA";
+         
+         
+   // Analysis 
+         
+   if(iMACD_main_buffer[0]>iMACD_signal_buffer[0] && 
+      iMACD_signal_buffer[1] > iMACD_main_buffer[1])
+         gl_TipoOrdemMACD="COMPRA";
+
+   if(iMACD_main_buffer[0]<iMACD_signal_buffer[0] && 
+      iMACD_signal_buffer[1] > iMACD_main_buffer[1])
+         gl_TipoOrdemMACD="VENDA";         
+            
+   // Get the moving average + trend of MACD (+ vol)
+   // You can use one of the 7 averages available in Metatrade to calibrate your averages.
+   // You could use 1 and 2. Candle can cross the average and be false. 
+   // Check at the end of the candle and undo the operation if required.
+   
+   // ==== BUY
+   // ========
+   if(gl_tendenciaMM=="COMPRA" && gl_tendenciaMACD == "COMPRA")
+      gl_Order=1; // Buy
+      
+   // ==== Hold venda se ja esta posicionado
+   if(gl_openPosition == true && gl_positionType==POSITION_TYPE_BUY && gl_Order ==1)
+      gl_Order=0;  // Do nothing
+      
+   // ==== SELL
+   // =========
+   
+   if(gl_tendenciaMM=="VENDA" && gl_tendenciaMACD == "VENDA")
+      gl_Order=-1; // Sell
+      
+   // ==== Hold venda se ja esta posicionado
+   if(gl_openPosition== true && gl_positionType==POSITION_TYPE_SELL && gl_Order ==-1)
+      gl_Order=0; // Do Nothing
+
+   // comenta grafico
+   Comment("glTicks: ", gl_ticks , " | glContratos: ",gl_contracts, " | glTendenciaMM: ",gl_tendenciaMM, " | glTendenciaMACD: ",gl_tendenciaMACD );
+
+   
+        
+   // Ready for order placement (bater a boleta)
+   // =================
+   //  ORDER PLACEMENT
+   // =================
+   
+   if(gl_Order!=0)
+   {
+   
+      MqlTick price_info;                       // create the price structure
+      ZeroMemory(price_info);                   // Clean the area
+      
+      if(!SymbolInfoTick(_Symbol,price_info))   // Populate the asset value
+      {  
+         Print(_Symbol," | ",__FUNCTION__, " | ", __LINE__," Erro to get SymbolInfoTich()");
+         return;  
+         
+      }
+      
+      if(gl_Order==1)      // Compra
+      {
+         //take from the guy that is selling (oferece o preco para ser habil para comprar. Se colocar ask, a ordem nao anda.
+         // stop loss is UNDER ask
+         if(trade.Buy(gl_contracts,_Symbol, price_info.bid,price_info.ask-stopLoss, price_info.ask+stopGain,"[CR01]"))
+         {
+            Print("Ordem enviada com sucesso");
+         } else {
+            Print("Ordem enviada com ERRO");         
+         }
+         
+      }
+      if(gl_Order==-1)     // Venda
+      {
+         if(trade.Sell(gl_contracts,_Symbol, price_info.bid, price_info.bid+stopLoss,price_info.bid-stopGain,"[CV01]"))
+         {
+            Print("Ordem enviada com sucesso");
+         } else {
+            Print("Ordem enviada com ERRO");         
+         }
+      }
+      
+      Sleep(60*1000);       // Counting 60 seconds after each deal, to support the topology OMS - Order Management System -> XP -> B3 ->OMS ->MetaTraderServer -> Your Server -> MT
+   
+   
+   }
+  
+   
+   
    
   }
 //+------------------------------------------------------------------+
